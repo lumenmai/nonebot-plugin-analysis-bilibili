@@ -1,22 +1,48 @@
-[tool.poetry]
+[project]
 name = "nonebot-plugin-analysis-bilibili"
-version = "2.8.4"
-description = "nonebot2解析bilibili插件"
-authors = ["mengshouer"]
-license = "MIT"
+version = "2.8.5"
+description = "B站链接与图文解析，支持按群控制卡片解析"
+authors = [{name = "mengshouer"}]
+license = {text = "MIT"}
 readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nonebot2>=2.3.3,<3",
+    "nonebot-adapter-onebot>=2.3.1,<3",
+    "nonebot-plugin-send-anything-anywhere>=0.6,<1",
+    "nonebot-plugin-localstore>=0.7.4,<0.8",
+    "aiohttp>=3.9,<4",
+    "yarl>=1.9,<2",
+]
 
-repository = "https://github.com/mengshouer/nonebot_plugin_analysis_bilibili"
-keywords = ["nonebot", "nonebot2", "bilibili"]
+[project.urls]
+Homepage = "https://github.com/mengshouer/nonebot_plugin_analysis_bilibili"
+Repository = "https://github.com/lumenmai/nonebot-plugin-analysis-bilibili"
+Issues = "https://github.com/lumenmai/nonebot-plugin-analysis-bilibili/issues"
 
-[tool.poetry.dependencies]
-python = "^3.8"
-aiohttp = "^3.7"
-nonebot2 = "^2.1.1"
-nonebot-plugin-send-anything-anywhere = "^0"
-
-[tool.poetry.dev-dependencies]
+[project.optional-dependencies]
+dev = [
+    "nonebot2[fastapi]>=2.3.3,<3",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.25,<0.26",
+    "pytest-mock>=3.14,<4",
+]
 
 [build-system]
-requires = ["poetry>=0.12"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nonebot_plugin_analysis_bilibili"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:nonebug"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F"]

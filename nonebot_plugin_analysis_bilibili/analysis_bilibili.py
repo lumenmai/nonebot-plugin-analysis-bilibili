@@ -8,7 +8,7 @@ from aiohttp import ClientSession
 from yarl import URL
 
 from .ExpiringCache import ExpiringCache
-from .sign import get_query, get_ticket
+from .wbi import get_query, get_ticket
 
 # analysis_stat : {group_id: ExpiringCache}
 analysis_stat: Dict[Union[int, str], ExpiringCache] = {}
@@ -25,22 +25,32 @@ ROOM_ID_REGEX = re.compile(r"live\.bilibili\.com/(blanc/|h5/)?(\d+)")
 CVID_REGEX = re.compile(
     r"(/read/(cv|mobile|native)(/|\?id=)?|(?<![a-zA-Z0-9])cv)(\d+)(?![a-zA-Z0-9])"
 )
-DYNAMIC_TYPE2_REGEX = re.compile(
-    r"(t|m)\.bilibili\.com/(\d+)\?(.*?)(&|&amp;)type=2"
-)
+DYNAMIC_TYPE2_REGEX = re.compile(r"(t|m)\.bilibili\.com/(\d+)\?(.*?)(&|&amp;)type=2")
 DYNAMIC_ID_REGEX = re.compile(r"(t|m)\.bilibili\.com/(opus/)?(\d+)")
 OPUS_ID_REGEX = re.compile(r"bilibili\.com/opus/(\d+)")
 DYNAMIC_MOBILE_REGEX = re.compile(r"m\.bilibili\.com/dynamic/(\d+)")
 
 
 config = nonebot.get_driver().config
-analysis_display_image = getattr(config, "analysis_display_image", False)
+analysis_display_image = getattr(config, "analysis_display_image", True)
 analysis_display_image_list = getattr(config, "analysis_display_image_list", [])
 images_size = getattr(config, "analysis_images_size", "")
 cover_images_size = getattr(config, "analysis_cover_images_size", "")
 reanalysis_time = getattr(config, "analysis_reanalysis_time", 0)
 
+try:
+    analysis_request_timeout = max(
+        1.0, float(getattr(config, "analysis_request_timeout", 15))
+    )
+except (TypeError, ValueError):
+    analysis_request_timeout = 15.0
+
 RISK_CODES = {-352, -412, -509, -799}
+RISK_HTTP_STATUS = {412, 429}
+API_UNAVAILABLE_MESSAGE = (
+    "B站接口触发安全风控或暂时不可用，请稍后重试；"
+    "如果持续出现，请配置有效的B站Cookie或更换网络出口。"
+)
 
 _analysis_cookie = getattr(config, "analysis_bilibili_cookie", "")
 if isinstance(_analysis_cookie, (list, tuple, set)):
@@ -61,6 +71,7 @@ def parse_cookie(cookie: str) -> Dict[str, str]:
 
 
 async def init_cookie(session: ClientSession, use_config: bool = True) -> None:
+    """初始化 B 站登录 Cookie 或匿名访问所需的 buvid。"""
     config_cookies = parse_cookie(analysis_bilibili_cookie) if use_config else {}
     current_cookies = session.cookie_jar.filter_cookies(
         URL("https://api.bilibili.com/")
@@ -73,30 +84,35 @@ async def init_cookie(session: ClientSession, use_config: bool = True) -> None:
         else:
             try:
                 async with session.get(
-                    "https://api.bilibili.com/x/frontend/finger/spi"
+                    "https://api.bilibili.com/x/frontend/finger/spi",
+                    timeout=min(5.0, analysis_request_timeout),
                 ) as resp:
-                    spi = (await resp.json(content_type=None)).get("data") or {}
-                cookies = {"buvid3": spi.get("b_3", ""), "buvid4": spi.get("b_4", "")}
-                cookies = {k: v for k, v in cookies.items() if v}
-                if cookies.get("buvid3"):
-                    _cached_spi_cookies.update(cookies)
+                    data = await resp.json(content_type=None)
+                    spi = data.get("data") if isinstance(data, dict) else {}
+                    spi = spi or {}
+                    cookies = {
+                        "buvid3": spi.get("b_3", ""),
+                        "buvid4": spi.get("b_4", ""),
+                    }
+                    cookies = {key: value for key, value in cookies.items() if value}
+                    if cookies.get("buvid3"):
+                        _cached_spi_cookies.update(cookies)
             except Exception as e:
-                nonebot.logger.warning(f"analysis_bilibili: 获取 buvid 失败 {e!r}")
+                nonebot.logger.warning(f"analysis_bilibili: 获取匿名 buvid 失败 {e!r}")
 
     if config_cookies:
         cookies.update(config_cookies)
 
-    if cookies:
-        if any(
-            k not in current_cookies or current_cookies[k].value != v
-            for k, v in cookies.items()
-        ):
-            if current_cookies:
-                for k, v in current_cookies.items():
-                    if k not in cookies:
-                        cookies[k] = v.value
-                session.cookie_jar.clear()
-            session.cookie_jar.update_cookies(cookies)
+    if cookies and any(
+        key not in current_cookies or current_cookies[key].value != value
+        for key, value in cookies.items()
+    ):
+        if current_cookies:
+            for key, value in current_cookies.items():
+                if key not in cookies:
+                    cookies[key] = value.value
+            session.cookie_jar.clear()
+        session.cookie_jar.update_cookies(cookies)
 
 
 async def fetch_api(
@@ -105,30 +121,56 @@ async def fetch_api(
     retry: int = 2,
     headers: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    for index in range(retry):
-        # 首次尝试允许使用配置的 cookie；重试时只用匿名指纹，避免沿用已过期的配置
+    """请求 B 站接口，并安全处理风控页、非 JSON 响应和有限重试。"""
+    attempts = max(1, retry)
+    for index in range(attempts):
         await init_cookie(session, use_config=index == 0)
+        status = 0
+        content_type = "unknown"
+        code: Union[int, str, None] = None
         try:
             async with session.get(url, headers=headers) as resp:
+                status = resp.status
+                content_type = resp.headers.get("Content-Type", "unknown")
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
                     data = None
+
                 if isinstance(data, dict):
+                    code = data.get("code")
                     inner = data.get("data")
                     has_voucher = isinstance(inner, dict) and "v_voucher" in inner
-                    if data.get("code") not in RISK_CODES and not has_voucher:
+                    if (
+                        status not in RISK_HTTP_STATUS
+                        and code not in RISK_CODES
+                        and not has_voucher
+                    ):
                         return data
-                    code = "v_voucher" if has_voucher else data.get("code")
+                    if has_voucher:
+                        code = "v_voucher"
                 else:
                     code = "非 JSON"
+
+                reason = (
+                    "接口风控"
+                    if status in RISK_HTTP_STATUS
+                    or code in RISK_CODES
+                    or code == "v_voucher"
+                    else "接口响应异常"
+                )
                 nonebot.logger.warning(
-                    f"analysis_bilibili: 接口风控 (HTTP {resp.status} / code {code}) {url}"
+                    f"analysis_bilibili: {reason} "
+                    f"(HTTP {status} / code {code} / Content-Type {content_type}) "
+                    f"{url}"
                 )
         except Exception as e:
-            nonebot.logger.warning(f"analysis_bilibili: 请求失败 {e!r} {url}")
-        if index < retry - 1:
-            # 清空 cookie 后重新获取，避免沿用已被风控的指纹
+            nonebot.logger.warning(
+                f"analysis_bilibili: 请求失败 "
+                f"(HTTP {status} / Content-Type {content_type}) {e!r} {url}"
+            )
+
+        if index < attempts - 1:
             _cached_spi_cookies.clear()
             ticket = session.cookie_jar.filter_cookies(
                 URL("https://api.bilibili.com/")
@@ -138,7 +180,6 @@ async def fetch_api(
                 session.cookie_jar.update_cookies({"bili_ticket": ticket.value})
             await asyncio.sleep(1)
     return None
-
 
 
 def resize_image(src: str, is_cover=False) -> str:
@@ -278,34 +319,28 @@ def extract(text: str) -> Tuple[str, Optional[str], Optional[str]]:
         return "", None, None
 
 
-async def search_bili_by_title(title: str, session: ClientSession) -> Optional[str]:
+async def search_bili_by_title(title: str, session: ClientSession) -> str:
     try:
-        # 先请求主站以获取配套的 buvid3 与 b_nut，避免先调 init_cookie 导致主站不下发 b_nut 触发搜索 v_voucher 验证
-        mainsite_url = "https://www.bilibili.com"
-        async with session.get(mainsite_url) as resp:
-            assert resp.status == 200
-
-        query = await get_query({"keyword": title})
+        # 先访问主站获取配套 Cookie，再初始化匿名指纹，避免缺少 b_nut。
+        async with session.get("https://www.bilibili.com") as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"B站主站返回 HTTP {resp.status}")
+        query = await get_query({"keyword": title}, session=session)
         search_url = (
             f"https://api.bilibili.com/x/web-interface/wbi/search/all/v2?{query}"
         )
-
-        bili_ticket = await get_ticket()
-
-        session.cookie_jar.update_cookies({"bili_ticket": bili_ticket})
-
+        ticket = await get_ticket(session=session)
+        session.cookie_jar.update_cookies({"bili_ticket": ticket})
         result = await fetch_api(
-            session,
-            search_url,
-            headers={"Referer": "https://search.bilibili.com/"},
+            session, search_url, headers={"Referer": "https://search.bilibili.com/"}
         )
         if not result:
             return None
 
-        for i in (result.get("data") or {}).get("result", []):
-            if i.get("result_type") != "video":
+        for item in (result.get("data") or {}).get("result", []):
+            if item.get("result_type") != "video":
                 continue
-            videos = i.get("data") or []
+            videos = item.get("data") or []
             if videos:
                 # 只返回第一个结果
                 return videos[0].get("arcurl")
@@ -327,7 +362,7 @@ async def video_detail(
     try:
         data = await fetch_api(session, url)
         if data is None:
-            return None, None
+            return API_UNAVAILABLE_MESSAGE, None
         res = data.get("data")
         if not res:
             return "解析到视频被删了/稿件不可见或审核中/权限不足", url
@@ -368,7 +403,7 @@ async def video_detail(
         return msg, vurl
     except Exception as e:
         nonebot.logger.warning(f"analysis_bilibili: 视频解析失败 {e!r} {url}")
-        return None, None
+        return "视频信息解析失败，请稍后重试。", None
 
 
 async def bangumi_detail(
@@ -379,14 +414,16 @@ async def bangumi_detail(
         if "media_id" in url:
             is_media = True
             data = await fetch_api(session, url)
-            ssid = ((data or {}).get("result") or {}).get("media") or {}
-            ssid = ssid.get("season_id")
+            if not data:
+                return None, None
+            media = (data.get("result") or {}).get("media") or {}
+            ssid = media.get("season_id")
             if not ssid:
                 return None, None
             url = f"https://api.bilibili.com/pgc/view/web/season?season_id={ssid}"
 
         data = await fetch_api(session, url)
-        if data is None:
+        if not data:
             return None, None
         res = data.get("result")
         if not res:
@@ -421,8 +458,9 @@ async def bangumi_detail(
         msg = [cover, f"{vurl}\n", title, long_title, desc, styles, evaluate]
         return msg, vurl
     except Exception as e:
-        nonebot.logger.warning(f"analysis_bilibili: 番剧解析失败 {e!r} {url}")
-        return None, None
+        msg = "番剧解析出错--Error: {}".format(type(e))
+        msg += f"\n{url}"
+        return msg, None
 
 
 async def live_detail(url: str, session: ClientSession) -> Tuple[List[str], str]:
@@ -474,8 +512,8 @@ async def live_detail(url: str, session: ClientSession) -> Tuple[List[str], str]
         msg = [cover, vurl, title, up, watch, tags, player]
         return msg, vurl
     except Exception as e:
-        nonebot.logger.warning(f"analysis_bilibili: 直播间解析失败 {e!r} {url}")
-        return None, None
+        msg = "直播间解析出错--Error: {}".format(type(e))
+        return msg, None
 
 
 async def article_detail(
@@ -509,51 +547,8 @@ async def article_detail(
         msg = [images, title, up, desc, vurl]
         return msg, vurl
     except Exception as e:
-        nonebot.logger.warning(f"analysis_bilibili: 专栏解析失败 {e!r} {url}")
-        return None, None
-
-
-def _normalize_desktop_dynamic(item: dict) -> dict:
-    modules_list = item.get("modules")
-    if not isinstance(modules_list, list):
-        return item
-
-    desc = None
-    major = None
-    orig = None
-    for mod in modules_list:
-        mtype = mod.get("module_type")
-        if mtype == "MODULE_TYPE_DESC":
-            desc = mod.get("module_desc")
-        elif mtype == "MODULE_TYPE_DYNAMIC":
-            mdyn = mod.get("module_dynamic") or {}
-            if mdyn.get("dyn_archive"):
-                arch = mdyn["dyn_archive"]
-                bvid = arch.get("bvid") or ""
-                major = {
-                    "archive": {
-                        "jump_url": f"//www.bilibili.com/video/{bvid}" if bvid else "",
-                        "cover": arch.get("cover") or "",
-                        "desc": arch.get("desc") or "",
-                    }
-                }
-            elif mdyn.get("dyn_draw"):
-                major = {"draw": mdyn["dyn_draw"]}
-            elif mdyn.get("dyn_forward"):
-                orig = (mdyn["dyn_forward"] or {}).get("item")
-
-    return {
-        "id_str": item.get("id_str", ""),
-        "type": item.get("type", ""),
-        "orig": orig,
-        "modules": {
-            "module_dynamic": {
-                "desc": desc,
-                "additional": None,
-                "major": major,
-            }
-        },
-    }
+        msg = "专栏解析出错--Error: {}".format(type(e))
+        return msg, None
 
 
 async def dynamic_detail(
@@ -658,6 +653,49 @@ async def dynamic_detail(
         return None, None
 
 
+def _normalize_desktop_dynamic(item: dict) -> dict:
+    modules_list = item.get("modules")
+    if not isinstance(modules_list, list):
+        return item
+
+    desc = None
+    major = None
+    orig = None
+    for mod in modules_list:
+        mtype = mod.get("module_type")
+        if mtype == "MODULE_TYPE_DESC":
+            desc = mod.get("module_desc")
+        elif mtype == "MODULE_TYPE_DYNAMIC":
+            mdyn = mod.get("module_dynamic") or {}
+            if mdyn.get("dyn_archive"):
+                arch = mdyn["dyn_archive"]
+                bvid = arch.get("bvid") or ""
+                major = {
+                    "archive": {
+                        "jump_url": f"//www.bilibili.com/video/{bvid}" if bvid else "",
+                        "cover": arch.get("cover") or "",
+                        "desc": arch.get("desc") or "",
+                    }
+                }
+            elif mdyn.get("dyn_draw"):
+                major = {"draw": mdyn["dyn_draw"]}
+            elif mdyn.get("dyn_forward"):
+                orig = (mdyn["dyn_forward"] or {}).get("item")
+
+    return {
+        "id_str": item.get("id_str", ""),
+        "type": item.get("type", ""),
+        "orig": orig,
+        "modules": {
+            "module_dynamic": {
+                "desc": desc,
+                "additional": None,
+                "major": major,
+            }
+        },
+    }
+
+
 def _extract_nodes_text(nodes: list) -> str:
     parts: List[str] = []
     for node in nodes:
@@ -735,14 +773,9 @@ async def opus_detail(
                 pub_time = (author_info.get("pub_time") or "").strip()
             elif module_type == "MODULE_TYPE_TOP":
                 top_pics = (
-                    (
-                        ((module.get("module_top") or {}).get("display") or {}).get(
-                            "album"
-                        )
-                        or {}
-                    ).get("pics")
-                    or []
-                )
+                    ((module.get("module_top") or {}).get("display") or {}).get("album")
+                    or {}
+                ).get("pics") or []
                 raw_pics.extend(pic["url"] for pic in top_pics if pic.get("url"))
             elif module_type == "MODULE_TYPE_CONTENT":
                 module_content = module.get("module_content") or {}
